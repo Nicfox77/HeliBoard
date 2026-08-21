@@ -2,6 +2,12 @@ name: Build debug APK
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feature/parakeet-inline-voice
+    paths:
+      - 'app/**'
+      - '.github/workflows/build-debug-apk.yml'
 
 jobs:
   build:
@@ -28,8 +34,9 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: HeliBoard-debug
+          name: HeliBoard-inline-voice-debug
           path: app/build/outputs/apk/debug/*-debug*.apk
+          retention-days: 14
 
       - name: Archive reports for failed job
         uses: actions/upload-artifact@v4
