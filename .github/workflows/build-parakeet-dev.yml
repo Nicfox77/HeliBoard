@@ -1,6 +1,7 @@
 name: Build HeliBoard Parakeet dev APK
 
 on:
+  pull_request:
   push:
     branches:
       - feature/parakeet-inline-voice
@@ -100,6 +101,7 @@ jobs:
           sha256sum dist/HeliBoard-Parakeet-dev.apk | tee dist/HeliBoard-Parakeet-dev.apk.sha256
 
       - name: Publish direct APK dev release
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
