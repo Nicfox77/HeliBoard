@@ -13,8 +13,8 @@ import android.speech.RecognitionListener
 import android.speech.RecognitionService
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import android.util.Log
 import androidx.core.content.ContextCompat
-import helium314.keyboard.latin.utils.Log
 
 /**
  * Drives an installed Offline Voice Input RecognitionService without leaving HeliBoard.
