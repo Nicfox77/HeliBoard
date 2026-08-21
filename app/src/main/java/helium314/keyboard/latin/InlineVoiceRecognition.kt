@@ -3,6 +3,7 @@ package helium314.keyboard.latin
 
 import android.Manifest
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.inputmethodservice.InputMethodService
@@ -15,6 +16,28 @@ import android.util.Log
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import kotlin.math.sqrt
+
+/**
+ * Context + callback object passed to the embedded Rust engine.
+ *
+ * The native model loader needs normal Android Context methods such as
+ * getFilesDir() and getAssets(), while the streaming worker also needs callback
+ * methods for status/results. Keeping both on one ContextWrapper lets the
+ * existing transcribe engine run inside HeliBoard without a second app/service.
+ */
+private class ParakeetNativeContext(base: Context) : ContextWrapper(base) {
+    @Suppress("unused")
+    fun onStatusUpdate(status: String) = InlineVoiceRecognition.onStatusUpdate(status)
+
+    @Suppress("unused")
+    fun onPartialResults(text: String) = InlineVoiceRecognition.onPartialResults(text)
+
+    @Suppress("unused")
+    fun onResults(text: String) = InlineVoiceRecognition.onResults(text)
+
+    @Suppress("unused")
+    fun onError(error: Int) = InlineVoiceRecognition.onError(error)
+}
 
 /**
  * Native Parakeet Unified dictation embedded directly in HeliBoard.
@@ -58,6 +81,7 @@ object InlineVoiceRecognition {
 
     private var nativeInitialized = false
     private var nativeLoadError: Throwable? = null
+    private var nativeContext: ParakeetNativeContext? = null
 
     init {
         try {
@@ -69,8 +93,8 @@ object InlineVoiceRecognition {
         }
     }
 
-    private external fun initNative(target: InlineVoiceRecognition)
-    private external fun startNative(target: InlineVoiceRecognition)
+    private external fun initNative(target: ParakeetNativeContext)
+    private external fun startNative(target: ParakeetNativeContext)
     private external fun feedAudioNative(samples: ShortArray, length: Int)
     private external fun finishNative()
     private external fun cancelNative()
@@ -102,7 +126,7 @@ object InlineVoiceRecognition {
             return true
         }
 
-        ensureNativeInitialized()
+        ensureNativeInitialized(ime)
 
         if (active) {
             finishSession()
@@ -127,7 +151,7 @@ object InlineVoiceRecognition {
         lastVoiceAt = startedAt
 
         return try {
-            startNative(this)
+            startNative(requireNotNull(nativeContext))
             startAudioCapture()
             mainHandler.post(endpointCheck)
             showStatus("Voice: listening")
@@ -141,9 +165,12 @@ object InlineVoiceRecognition {
         }
     }
 
-    private fun ensureNativeInitialized() {
+    private fun ensureNativeInitialized(context: Context) {
+        if (nativeContext == null) {
+            nativeContext = ParakeetNativeContext(context.applicationContext)
+        }
         if (nativeInitialized) return
-        initNative(this)
+        initNative(requireNotNull(nativeContext))
         nativeInitialized = true
     }
 
