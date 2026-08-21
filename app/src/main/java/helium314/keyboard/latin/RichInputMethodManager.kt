@@ -54,7 +54,7 @@ class RichInputMethodManager private constructor() {
 
     private var shortcuts = listOf<Shortcut>()
 
-    val isShortcutImeReady get() = shortcuts.isNotEmpty()
+    val isShortcutImeReady get() = shortcuts.isNotEmpty() || InlineVoiceRecognition.isAvailable(context)
 
     fun getEnabledInputMethodSubtypes(imi: InputMethodInfo, allowsImplicitlySelectedSubtypes: Boolean) =
         inputMethodInfoCache.getEnabledInputMethodSubtypeList(imi, allowsImplicitlySelectedSubtypes)
@@ -192,6 +192,8 @@ class RichInputMethodManager private constructor() {
                 ++auxCount
             }
 
+            // If shouldIncludeAuxiliarySubtypes is true, IMEs that have two or more auxiliary
+            // subtypes should be counted as well.
             if (shouldIncludeAuxiliarySubtypes && auxCount > 1) {
                 ++filteredImisCount
             }
@@ -201,6 +203,9 @@ class RichInputMethodManager private constructor() {
             return true
         }
         val subtypes = SubtypeSettings.getEnabledSubtypes(true)
+        // imm.getEnabledInputMethodSubtypeList(null, true) will return the current IME's
+        // both explicitly and implicitly enabled input method subtype.
+        // (The current IME should be LatinIME.)
         return subtypes.count { it.mode == Constants.Subtype.KEYBOARD_MODE } > 1
     }
 
@@ -259,6 +264,7 @@ class RichInputMethodManager private constructor() {
 private class InputMethodInfoCache(private val imm: InputMethodManager, private val imePackageName: String) {
     private var cachedThisImeInfo: InputMethodInfo? = null
     private val cachedSubtypeListWithImplicitlySelected = HashMap<InputMethodInfo, List<InputMethodSubtype>>()
+
     private val cachedSubtypeListOnlyExplicitlySelected = HashMap<InputMethodInfo, List<InputMethodSubtype>>()
 
     @get:Synchronized
