@@ -126,13 +126,21 @@ class RichInputMethodManager private constructor() {
         scope.launch { updateShortcutIme() }
     }
 
-    fun switchToShortcutIme(inputMethodService: InputMethodService) = scope.launch {
-        val imiId = shortcuts.firstOrNull()?.imi?.id ?: return@launch
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            inputMethodService.switchInputMethod(imiId, shortcuts.first().subtype)
-        } else {
-            val token = inputMethodService.window.window?.attributes?.token ?: return@launch
-            @Suppress("Deprecation") imm.setInputMethodAndSubtype(token, imiId, shortcuts.first().subtype)
+    fun switchToShortcutIme(inputMethodService: InputMethodService) {
+        // Prefer a normal SpeechRecognizer session when our offline recognizer is
+        // installed. This keeps HeliBoard visible and lets results flow directly
+        // into the current InputConnection. If it is not installed, preserve
+        // HeliBoard's original shortcut-IME behavior unchanged.
+        if (InlineVoiceRecognition.startOrToggle(inputMethodService)) return
+
+        scope.launch {
+            val imiId = shortcuts.firstOrNull()?.imi?.id ?: return@launch
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                inputMethodService.switchInputMethod(imiId, shortcuts.first().subtype)
+            } else {
+                val token = inputMethodService.window.window?.attributes?.token ?: return@launch
+                @Suppress("Deprecation") imm.setInputMethodAndSubtype(token, imiId, shortcuts.first().subtype)
+            }
         }
     }
 
@@ -184,8 +192,6 @@ class RichInputMethodManager private constructor() {
                 ++auxCount
             }
 
-            // If shouldIncludeAuxiliarySubtypes is true, IMEs that have two or more auxiliary
-            // subtypes should be counted as well.
             if (shouldIncludeAuxiliarySubtypes && auxCount > 1) {
                 ++filteredImisCount
             }
@@ -195,9 +201,6 @@ class RichInputMethodManager private constructor() {
             return true
         }
         val subtypes = SubtypeSettings.getEnabledSubtypes(true)
-        // imm.getEnabledInputMethodSubtypeList(null, true) will return the current IME's
-        // both explicitly and implicitly enabled input method subtype.
-        // (The current IME should be LatinIME.)
         return subtypes.count { it.mode == Constants.Subtype.KEYBOARD_MODE } > 1
     }
 
@@ -256,7 +259,6 @@ class RichInputMethodManager private constructor() {
 private class InputMethodInfoCache(private val imm: InputMethodManager, private val imePackageName: String) {
     private var cachedThisImeInfo: InputMethodInfo? = null
     private val cachedSubtypeListWithImplicitlySelected = HashMap<InputMethodInfo, List<InputMethodSubtype>>()
-
     private val cachedSubtypeListOnlyExplicitlySelected = HashMap<InputMethodInfo, List<InputMethodSubtype>>()
 
     @get:Synchronized
