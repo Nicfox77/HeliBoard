@@ -3,6 +3,7 @@ package helium314.keyboard.latin
 
 import android.Manifest
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.inputmethodservice.InputMethodService
@@ -37,6 +38,9 @@ object InlineVoiceRecognition {
     private var hasComposingText = false
     private var lastPartial = ""
     private var leadingSpace = ""
+
+    @JvmStatic
+    fun isAvailable(context: Context): Boolean = findOfflineRecognizer(context) != null
 
     /**
      * @return true when Offline Voice Input was found (or its permission flow was
@@ -169,9 +173,9 @@ object InlineVoiceRecognition {
     }
 
     @Suppress("DEPRECATION")
-    private fun findOfflineRecognizer(ime: InputMethodService): ComponentName? {
+    private fun findOfflineRecognizer(context: Context): ComponentName? {
         val intent = Intent(RecognitionService.SERVICE_INTERFACE)
-        val services = ime.packageManager.queryIntentServices(intent, 0)
+        val services = context.packageManager.queryIntentServices(intent, 0)
             .mapNotNull { it.serviceInfo }
 
         val service = services.firstOrNull { it.packageName == TEST_PACKAGE }
