@@ -1,0 +1,113 @@
+name: Build HeliBoard Parakeet dev APK
+
+on:
+  push:
+    branches:
+      - feature/parakeet-inline-voice
+    paths:
+      - 'app/**'
+      - '.github/workflows/build-parakeet-dev.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout HeliBoard
+        uses: actions/checkout@v4
+
+      - name: Checkout Parakeet native engine
+        uses: actions/checkout@v4
+        with:
+          repository: Nicfox77/android_transcribe_app
+          ref: feature/parakeet-unified-streaming
+          path: parakeet-engine
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager --install "ndk;28.0.13004108"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          cargo install cargo-ndk
+
+      - name: Build embedded Parakeet native library
+        working-directory: parakeet-engine
+        env:
+          TRANSCRIBE_CMAKE_ARGS: -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+        run: cargo ndk -t arm64-v8a build --release
+
+      - name: Bundle native libraries into HeliBoard
+        run: |
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cp parakeet-engine/target/aarch64-linux-android/release/libandroid_transcribe_app.so \
+            app/src/main/jniLibs/arm64-v8a/
+          cp "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
+            app/src/main/jniLibs/arm64-v8a/
+
+      - name: Bundle Parakeet Unified Q4 model
+        run: |
+          mkdir -p app/src/main/assets/builtin-model
+          MODEL=app/src/main/assets/builtin-model/parakeet-unified-en-0.6b-Q4_K_M.gguf
+          curl -L --fail --retry 4 --retry-delay 3 \
+            -o "$MODEL" \
+            https://huggingface.co/handy-computer/parakeet-unified-en-0.6b-gguf/resolve/main/parakeet-unified-en-0.6b-Q4_K_M.gguf
+          echo "a8bf3de2b393bd14ead5a858c3748d5e3b07a20fdeabdd3b498fba4f463fa929  $MODEL" | sha256sum -c -
+
+      - name: Limit dev APK to arm64
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/build.gradle.kts')
+          s = p.read_text()
+          old = 'abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))'
+          if old not in s:
+              raise SystemExit('expected abiFilters declaration not found')
+          p.write_text(s.replace(old, 'abiFilters.add("arm64-v8a")', 1))
+          PY
+
+      - name: Build single-app debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Prepare direct APK asset
+        run: |
+          mkdir -p dist
+          APK=$(find app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' -print -quit)
+          test -n "$APK"
+          cp "$APK" dist/HeliBoard-Parakeet-dev.apk
+          sha256sum dist/HeliBoard-Parakeet-dev.apk | tee dist/HeliBoard-Parakeet-dev.apk.sha256
+
+      - name: Publish direct APK dev release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete parakeet-dev --cleanup-tag -y || true
+          gh release create parakeet-dev \
+            dist/HeliBoard-Parakeet-dev.apk \
+            dist/HeliBoard-Parakeet-dev.apk.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "HeliBoard Parakeet dev" \
+            --prerelease \
+            --notes "Single-app development build: HeliBoard + embedded Parakeet Unified Q4 streaming engine. The APK is attached directly (not wrapped in a ZIP)."
