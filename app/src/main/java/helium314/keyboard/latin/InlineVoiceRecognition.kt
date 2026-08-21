@@ -2,7 +2,6 @@
 package helium314.keyboard.latin
 
 import android.Manifest
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -10,44 +9,36 @@ import android.inputmethodservice.InputMethodService
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import android.os.Build
-import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.ParcelFileDescriptor
-import android.speech.RecognitionListener
-import android.speech.RecognitionService
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.util.Log
 import android.widget.Toast
 import androidx.core.content.ContextCompat
-import java.io.OutputStream
+import kotlin.math.sqrt
 
 /**
- * Drives an installed Offline Voice Input RecognitionService without leaving HeliBoard.
+ * Native Parakeet Unified dictation embedded directly in HeliBoard.
  *
- * On Android 13+ HeliBoard owns the microphone and passes an already-open PCM stream to
- * RecognitionService via RecognizerIntent.EXTRA_AUDIO_SOURCE. This is both lower-friction
- * and more robust for while-in-use microphone permissions: the visible/current IME owns
- * RECORD_AUDIO, while the background recognizer only consumes PCM and runs inference.
- *
- * Partial hypotheses are kept in the editor as composing text so a newer hypothesis
- * replaces the previous one instead of being appended. The final result is then
- * finished/committed in place. Tapping the microphone while recognition is active
- * closes the audio source and requests immediate finalization.
+ * HeliBoard owns AudioRecord and feeds 16 kHz mono PCM16 over JNI into the
+ * bundled transcribe.cpp/Parakeet streaming engine. No second app,
+ * RecognitionService, SpeechRecognizer or cross-package microphone permission
+ * path is involved.
  */
 object InlineVoiceRecognition {
     private const val TAG = "InlineVoiceRecognition"
-    private const val TEST_PACKAGE = "dev.notune.transcribe.unifiedtest"
-    private const val RELEASE_PACKAGE = "dev.notune.transcribe"
     private const val SAMPLE_RATE = 16_000
+
+    private const val MIN_SPEECH_LEVEL = 0.12f
+    private const val SPEECH_MARGIN = 0.08f
+    private const val SILENCE_MS = 1_500L
+    private const val NO_SPEECH_TIMEOUT_MS = 7_000L
+    private const val MAX_SESSION_MS = 60_000L
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    private var recognizer: SpeechRecognizer? = null
     private var owner: InputMethodService? = null
     private var active = false
+    private var finishing = false
     private var hasComposingText = false
     private var lastPartial = ""
     private var leadingSpace = ""
@@ -56,104 +47,108 @@ object InlineVoiceRecognition {
     private var capturingAudio = false
     private var audioRecord: AudioRecord? = null
     private var audioThread: Thread? = null
-    private var audioSourceRead: ParcelFileDescriptor? = null
-    private var audioSourceOutput: OutputStream? = null
+
+    @Volatile
+    private var speechStarted = false
+    @Volatile
+    private var lastVoiceAt = 0L
+    @Volatile
+    private var noiseFloor = 0.0f
+    private var startedAt = 0L
+
+    private var nativeInitialized = false
+    private var nativeLoadError: Throwable? = null
+
+    init {
+        try {
+            System.loadLibrary("c++_shared")
+            System.loadLibrary("android_transcribe_app")
+        } catch (t: Throwable) {
+            nativeLoadError = t
+            Log.e(TAG, "Failed to load embedded Parakeet native libraries", t)
+        }
+    }
+
+    private external fun initNative(target: InlineVoiceRecognition)
+    private external fun startNative(target: InlineVoiceRecognition)
+    private external fun feedAudioNative(samples: ShortArray, length: Int)
+    private external fun finishNative()
+    private external fun cancelNative()
+    private external fun destroyNative()
 
     @JvmStatic
-    fun isAvailable(context: Context): Boolean = findOfflineRecognizer(context) != null
+    fun isAvailable(@Suppress("UNUSED_PARAMETER") context: Context): Boolean = nativeLoadError == null
 
-    /**
-     * @return true when Offline Voice Input was found (or its permission flow was
-     * started), false when HeliBoard should fall back to its normal voice-IME switch.
-     */
+    /** Toggle embedded dictation. The second tap finalizes immediately. */
     @JvmStatic
     fun startOrToggle(ime: InputMethodService): Boolean {
-        val component = findOfflineRecognizer(ime) ?: return false
-
         if (Looper.myLooper() != Looper.getMainLooper()) {
             mainHandler.post { startOrToggle(ime) }
+            return true
+        }
+
+        nativeLoadError?.let {
+            Toast.makeText(ime, "Parakeet native engine unavailable", Toast.LENGTH_SHORT).show()
+            Log.e(TAG, "Native engine unavailable", it)
             return true
         }
 
         if (ContextCompat.checkSelfPermission(ime, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
-            val permissionIntent = Intent(ime, VoicePermissionActivity::class.java).apply {
+            ime.startActivity(Intent(ime, VoicePermissionActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            ime.startActivity(permissionIntent)
+            })
             return true
         }
+
+        ensureNativeInitialized()
 
         if (active) {
-            showStatus("Voice: stopping…")
-            // Closing the caller-owned pipe tells an EXTRA_AUDIO_SOURCE recognizer that
-            // no more audio is coming. stopListening() remains useful for the fallback
-            // service-microphone path and makes manual finalization immediate.
-            stopCallerAudioCapture()
-            recognizer?.stopListening()
+            finishSession()
             return true
         }
 
-        cleanupRecognizer(keepComposingText = true)
+        cleanupState(cancelNativeSession = true, clearComposing = false)
         owner = ime
         active = true
+        finishing = false
         hasComposingText = false
         lastPartial = ""
 
-        // End any normal HeliBoard composing word first. Dictation gets its own
-        // composing range so partial revisions cannot overwrite what was typed before it.
         val connection = ime.currentInputConnection
         connection?.finishComposingText()
         val before = connection?.getTextBeforeCursor(1, 0)?.toString().orEmpty()
         leadingSpace = if (before.isNotEmpty() && !before.last().isWhitespace()) " " else ""
 
+        speechStarted = false
+        noiseFloor = 0.0f
+        startedAt = android.os.SystemClock.elapsedRealtime()
+        lastVoiceAt = startedAt
+
         return try {
-            val speechRecognizer = SpeechRecognizer.createSpeechRecognizer(ime, component)
-            recognizer = speechRecognizer
-            speechRecognizer.setRecognitionListener(listener)
-
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-            }
-
-            val usingCallerAudio = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
-            if (usingCallerAudio) {
-                prepareCallerAudioSource(intent)
-            }
-
-            showStatus("Voice: connecting to ${component.packageName}")
-            speechRecognizer.startListening(intent)
-
-            if (usingCallerAudio) {
-                startCallerAudioCapture()
-                Log.i(TAG, "Started inline recognition with caller-owned AudioRecord: $component")
-            } else {
-                Log.i(TAG, "Started inline recognition with service microphone fallback: $component")
-            }
+            startNative(this)
+            startAudioCapture()
+            mainHandler.post(endpointCheck)
+            showStatus("Voice: listening")
+            Log.i(TAG, "Started embedded Parakeet streaming session")
             true
         } catch (t: Throwable) {
-            Log.e(TAG, "Could not start inline recognition", t)
+            Log.e(TAG, "Could not start embedded Parakeet", t)
             showStatus("Voice start failed: ${t.javaClass.simpleName}")
-            try {
-                recognizer?.cancel()
-            } catch (_: Throwable) {
-            }
-            cleanupRecognizer(keepComposingText = false)
+            cleanupState(cancelNativeSession = true, clearComposing = true)
             true
         }
     }
 
-    /** Prepare a pipe + AudioRecord before startListening so the read FD is in the intent. */
-    private fun prepareCallerAudioSource(intent: Intent) {
-        stopCallerAudioCapture()
+    private fun ensureNativeInitialized() {
+        if (nativeInitialized) return
+        initNative(this)
+        nativeInitialized = true
+    }
 
-        val pipe = ParcelFileDescriptor.createPipe()
-        audioSourceRead = pipe[0]
-        audioSourceOutput = ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])
+    private fun startAudioCapture() {
+        stopAudioCapture()
 
         val minBytes = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
@@ -176,91 +171,104 @@ object InlineVoiceRecognition {
 
         if (record.state != AudioRecord.STATE_INITIALIZED) {
             record.release()
-            throw IllegalStateException("HeliBoard AudioRecord failed to initialize")
+            throw IllegalStateException("AudioRecord failed to initialize")
         }
+
         audioRecord = record
-
-        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, audioSourceRead)
-        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
-        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
-        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, SAMPLE_RATE)
-    }
-
-    /** Start microphone capture and write little-endian PCM16 into the recognizer pipe. */
-    private fun startCallerAudioCapture() {
-        val record = audioRecord ?: throw IllegalStateException("AudioRecord not prepared")
-        val output = audioSourceOutput ?: throw IllegalStateException("Audio pipe not prepared")
-
         capturingAudio = true
         record.startRecording()
         if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-            capturingAudio = false
-            throw IllegalStateException("HeliBoard AudioRecord failed to start")
+            stopAudioCapture()
+            throw IllegalStateException("AudioRecord failed to start")
         }
 
         audioThread = Thread({
             val samples = ShortArray(1024)
-            val bytes = ByteArray(samples.size * 2)
             try {
                 while (capturingAudio) {
-                    val count = record.read(samples, 0, samples.size, AudioRecord.READ_BLOCKING)
+                    val current = audioRecord ?: break
+                    val count = current.read(samples, 0, samples.size, AudioRecord.READ_BLOCKING)
                     if (count <= 0) {
                         if (count < 0 && capturingAudio) {
-                            Log.e(TAG, "HeliBoard AudioRecord read failed: $count")
+                            Log.e(TAG, "AudioRecord read failed: $count")
                         }
                         break
                     }
-
-                    var b = 0
-                    for (i in 0 until count) {
-                        val value = samples[i].toInt()
-                        bytes[b++] = (value and 0xff).toByte()
-                        bytes[b++] = ((value ushr 8) and 0xff).toByte()
-                    }
-                    output.write(bytes, 0, count * 2)
+                    updateVad(samples, count)
+                    feedAudioNative(samples, count)
                 }
             } catch (t: Throwable) {
-                // A closed reader is normal when the recognizer auto-finalizes first.
                 if (capturingAudio) {
-                    Log.w(TAG, "Caller audio pipe ended: ${t.javaClass.simpleName}: ${t.message}")
-                }
-            } finally {
-                try {
-                    output.close()
-                } catch (_: Throwable) {
+                    Log.e(TAG, "Embedded audio capture failed", t)
+                    mainHandler.post {
+                        showStatus("Voice audio error")
+                        cleanupState(cancelNativeSession = true, clearComposing = false)
+                    }
                 }
             }
-        }, "heliboard-inline-voice-capture").also { it.start() }
+        }, "heliboard-parakeet-capture").also { it.start() }
     }
 
-    private fun stopCallerAudioCapture() {
-        capturingAudio = false
+    private fun updateVad(samples: ShortArray, count: Int) {
+        var energy = 0.0
+        for (i in 0 until count) {
+            val value = samples[i].toDouble() / 32768.0
+            energy += value * value
+        }
+        val rms = sqrt(energy / count.coerceAtLeast(1)).toFloat()
+        val level = (rms * 6.0f).coerceIn(0.0f, 1.0f)
+        val floor = noiseFloor
+        val speech = level > MIN_SPEECH_LEVEL && level > floor + SPEECH_MARGIN
 
+        if (speech) {
+            lastVoiceAt = android.os.SystemClock.elapsedRealtime()
+            if (!speechStarted) {
+                speechStarted = true
+                mainHandler.post { showStatus("Voice: listening") }
+            }
+        } else {
+            noiseFloor = floor * 0.95f + level * 0.05f
+        }
+    }
+
+    private val endpointCheck = object : Runnable {
+        override fun run() {
+            if (!active || finishing) return
+            val now = android.os.SystemClock.elapsedRealtime()
+            val elapsed = now - startedAt
+            val done = (speechStarted && now - lastVoiceAt >= SILENCE_MS) ||
+                (!speechStarted && elapsed >= NO_SPEECH_TIMEOUT_MS) ||
+                elapsed >= MAX_SESSION_MS
+
+            if (done) {
+                if (speechStarted) {
+                    finishSession()
+                } else {
+                    showStatus("Voice: no speech")
+                    cleanupState(cancelNativeSession = true, clearComposing = false)
+                }
+                return
+            }
+            mainHandler.postDelayed(this, 100L)
+        }
+    }
+
+    private fun finishSession() {
+        if (!active || finishing) return
+        finishing = true
+        mainHandler.removeCallbacks(endpointCheck)
+        stopAudioCapture()
+        showStatus("Voice: finalizing…")
+        finishNative()
+    }
+
+    private fun stopAudioCapture() {
+        capturingAudio = false
         val record = audioRecord
         audioRecord = null
         if (record != null) {
-            try {
-                record.stop()
-            } catch (_: Throwable) {
-            }
-            try {
-                record.release()
-            } catch (_: Throwable) {
-            }
-        }
-
-        val output = audioSourceOutput
-        audioSourceOutput = null
-        try {
-            output?.close()
-        } catch (_: Throwable) {
-        }
-
-        val readSide = audioSourceRead
-        audioSourceRead = null
-        try {
-            readSide?.close()
-        } catch (_: Throwable) {
+            try { record.stop() } catch (_: Throwable) {}
+            try { record.release() } catch (_: Throwable) {}
         }
 
         val thread = audioThread
@@ -274,127 +282,82 @@ object InlineVoiceRecognition {
         }
     }
 
-    private val listener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {
-            showStatus("Voice: ready — speak now")
+    // --- JNI callbacks from the embedded Rust worker -------------------------
+
+    @Suppress("unused")
+    fun onStatusUpdate(status: String) {
+        Log.d(TAG, "engine: $status")
+        if (status.startsWith("Loading") || status.startsWith("Error")) {
+            mainHandler.post { showStatus("Parakeet: $status") }
         }
+    }
 
-        override fun onBeginningOfSpeech() {
-            showStatus("Voice: listening")
-        }
-
-        override fun onRmsChanged(rmsdB: Float) = Unit
-        override fun onBufferReceived(buffer: ByteArray?) = Unit
-
-        override fun onEndOfSpeech() {
-            showStatus("Voice: finalizing…")
-            // The backend may endpoint before the caller; stop producing immediately.
-            stopCallerAudioCapture()
-        }
-
-        override fun onError(error: Int) {
-            Log.w(TAG, "Recognition error: $error (${errorName(error)})")
-            showStatus("Voice error $error: ${errorName(error)}")
-            owner?.currentInputConnection?.let { connection ->
-                if (hasComposingText) connection.finishComposingText()
-            }
-            cleanupRecognizer(keepComposingText = true)
-        }
-
-        override fun onResults(results: Bundle?) {
-            val finalText = firstResult(results)
-            val connection = owner?.currentInputConnection
-            if (connection != null && !finalText.isNullOrBlank()) {
-                val text = leadingSpace + finalText.trim()
-                if (hasComposingText) {
-                    connection.setComposingText(text, 1)
-                    connection.finishComposingText()
-                } else {
-                    connection.commitText(text, 1)
-                }
-                showStatus("Voice: done")
-            } else if (connection != null && hasComposingText) {
-                connection.finishComposingText()
-                showStatus("Voice: done")
-            } else {
-                showStatus("Voice: no text returned")
-            }
-            cleanupRecognizer(keepComposingText = true)
-        }
-
-        override fun onPartialResults(partialResults: Bundle?) {
-            val partial = firstResult(partialResults)?.trim().orEmpty()
-            if (partial.isEmpty() || partial == lastPartial) return
-
-            val connection = owner?.currentInputConnection ?: return
-            val text = leadingSpace + partial
-            if (connection.setComposingText(text, 1)) {
+    @Suppress("unused")
+    fun onPartialResults(text: String) {
+        val partial = text.trim()
+        if (partial.isEmpty() || partial == lastPartial) return
+        mainHandler.post {
+            val connection = owner?.currentInputConnection ?: return@post
+            val value = leadingSpace + partial
+            if (connection.setComposingText(value, 1)) {
                 hasComposingText = true
                 lastPartial = partial
             }
         }
+    }
 
-        override fun onEvent(eventType: Int, params: Bundle?) = Unit
+    @Suppress("unused")
+    fun onResults(text: String) {
+        mainHandler.post {
+            val finalText = text.trim()
+            val connection = owner?.currentInputConnection
+            if (connection != null && finalText.isNotEmpty()) {
+                val value = leadingSpace + finalText
+                if (hasComposingText) {
+                    connection.setComposingText(value, 1)
+                    connection.finishComposingText()
+                } else {
+                    connection.commitText(value, 1)
+                }
+                showStatus("Voice: done")
+            } else if (connection != null && hasComposingText) {
+                connection.finishComposingText()
+            }
+            cleanupState(cancelNativeSession = false, clearComposing = false)
+        }
+    }
+
+    @Suppress("unused")
+    fun onError(error: Int) {
+        mainHandler.post {
+            Log.w(TAG, "Embedded recognition error: $error")
+            showStatus(if (error == 7) "Voice: no match" else "Voice error $error")
+            owner?.currentInputConnection?.let { if (hasComposingText) it.finishComposingText() }
+            cleanupState(cancelNativeSession = false, clearComposing = false)
+        }
     }
 
     private fun showStatus(message: String) {
         val context = owner ?: return
-        mainHandler.post {
-            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun cleanupState(cancelNativeSession: Boolean, clearComposing: Boolean) {
+        mainHandler.removeCallbacks(endpointCheck)
+        stopAudioCapture()
+        if (cancelNativeSession && nativeInitialized) {
+            try { cancelNative() } catch (_: Throwable) {}
         }
-    }
-
-    private fun errorName(error: Int): String = when (error) {
-        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "network timeout"
-        SpeechRecognizer.ERROR_NETWORK -> "network"
-        SpeechRecognizer.ERROR_AUDIO -> "audio"
-        SpeechRecognizer.ERROR_SERVER -> "server/backend"
-        SpeechRecognizer.ERROR_CLIENT -> "client"
-        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "speech timeout"
-        SpeechRecognizer.ERROR_NO_MATCH -> "no match"
-        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "recognizer busy"
-        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "permission denied"
-        SpeechRecognizer.ERROR_TOO_MANY_REQUESTS -> "too many requests"
-        SpeechRecognizer.ERROR_SERVER_DISCONNECTED -> "service disconnected"
-        SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED -> "language not supported"
-        SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "language unavailable"
-        else -> "unknown"
-    }
-
-    private fun firstResult(bundle: Bundle?): String? =
-        bundle?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-
-    private fun cleanupRecognizer(keepComposingText: Boolean) {
-        stopCallerAudioCapture()
-        if (!keepComposingText && hasComposingText) {
+        if (clearComposing && hasComposingText) {
             owner?.currentInputConnection?.setComposingText("", 1)
         }
-        try {
-            recognizer?.destroy()
-        } catch (_: Throwable) {
-        }
-        recognizer = null
         owner = null
         active = false
+        finishing = false
         hasComposingText = false
         lastPartial = ""
         leadingSpace = ""
-    }
-
-    @Suppress("DEPRECATION")
-    private fun findOfflineRecognizer(context: Context): ComponentName? {
-        val intent = Intent(RecognitionService.SERVICE_INTERFACE)
-        val services = context.packageManager.queryIntentServices(intent, 0)
-            .mapNotNull { it.serviceInfo }
-
-        val service = services.firstOrNull { it.packageName == TEST_PACKAGE }
-            ?: services.firstOrNull { it.packageName == RELEASE_PACKAGE }
-            ?: services.firstOrNull {
-                it.packageName.startsWith(RELEASE_PACKAGE) &&
-                    it.name.endsWith("VoiceRecognitionService")
-            }
-            ?: return null
-
-        return ComponentName(service.packageName, service.name)
+        speechStarted = false
+        noiseFloor = 0.0f
     }
 }
