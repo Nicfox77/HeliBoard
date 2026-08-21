@@ -3,8 +3,7 @@
     SPDX-License-Identifier: GPL-3.0-only
 -->
 <resources>
-    <string name="english_ime_name" translatable="false">HeliBoard Inline Voice</string>
-    <string name="spell_checker_service_name" translatable="false">HeliBoard Inline Voice Spell Checker</string>
-    <string name="ime_settings" translatable="false">HeliBoard Inline Voice Settings</string>
-
+    <string name="english_ime_name" translatable="false">HeliBoard Parakeet</string>
+    <string name="spell_checker_service_name" translatable="false">HeliBoard Parakeet Spell Checker</string>
+    <string name="ime_settings" translatable="false">HeliBoard Parakeet Settings</string>
 </resources>
