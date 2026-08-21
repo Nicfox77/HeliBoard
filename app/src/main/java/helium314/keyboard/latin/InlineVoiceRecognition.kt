@@ -15,6 +15,7 @@ import android.speech.RecognitionService
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
+import android.widget.Toast
 import androidx.core.content.ContextCompat
 
 /**
@@ -66,7 +67,7 @@ object InlineVoiceRecognition {
         }
 
         if (active) {
-            // SpeechRecognizer requires waiting for onResults/onError after stopListening.
+            showStatus("Voice: stopping…")
             recognizer?.stopListening()
             return true
         }
@@ -88,6 +89,7 @@ object InlineVoiceRecognition {
             val speechRecognizer = SpeechRecognizer.createSpeechRecognizer(ime, component)
             recognizer = speechRecognizer
             speechRecognizer.setRecognitionListener(listener)
+            showStatus("Voice: connecting to ${component.packageName}")
             speechRecognizer.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
@@ -98,23 +100,31 @@ object InlineVoiceRecognition {
             true
         } catch (t: Throwable) {
             Log.e(TAG, "Could not start inline recognition", t)
+            showStatus("Voice start failed: ${t.javaClass.simpleName}")
             cleanupRecognizer(keepComposingText = false)
-            // We did find the preferred service, so do not unexpectedly switch IMEs.
             true
         }
     }
 
     private val listener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) = Unit
-        override fun onBeginningOfSpeech() = Unit
+        override fun onReadyForSpeech(params: Bundle?) {
+            showStatus("Voice: ready — speak now")
+        }
+
+        override fun onBeginningOfSpeech() {
+            showStatus("Voice: listening")
+        }
+
         override fun onRmsChanged(rmsdB: Float) = Unit
         override fun onBufferReceived(buffer: ByteArray?) = Unit
-        override fun onEndOfSpeech() = Unit
+
+        override fun onEndOfSpeech() {
+            showStatus("Voice: finalizing…")
+        }
 
         override fun onError(error: Int) {
-            Log.w(TAG, "Recognition error: $error")
-            // If useful partial text already reached the editor, preserve it instead
-            // of deleting the user's dictation just because finalization errored.
+            Log.w(TAG, "Recognition error: $error (${errorName(error)})")
+            showStatus("Voice error $error: ${errorName(error)}")
             owner?.currentInputConnection?.let { connection ->
                 if (hasComposingText) connection.finishComposingText()
             }
@@ -132,8 +142,12 @@ object InlineVoiceRecognition {
                 } else {
                     connection.commitText(text, 1)
                 }
+                showStatus("Voice: done")
             } else if (connection != null && hasComposingText) {
                 connection.finishComposingText()
+                showStatus("Voice: done")
+            } else {
+                showStatus("Voice: no text returned")
             }
             cleanupRecognizer(keepComposingText = true)
         }
@@ -151,6 +165,30 @@ object InlineVoiceRecognition {
         }
 
         override fun onEvent(eventType: Int, params: Bundle?) = Unit
+    }
+
+    private fun showStatus(message: String) {
+        val context = owner ?: return
+        mainHandler.post {
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun errorName(error: Int): String = when (error) {
+        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "network timeout"
+        SpeechRecognizer.ERROR_NETWORK -> "network"
+        SpeechRecognizer.ERROR_AUDIO -> "audio"
+        SpeechRecognizer.ERROR_SERVER -> "server/backend"
+        SpeechRecognizer.ERROR_CLIENT -> "client"
+        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "speech timeout"
+        SpeechRecognizer.ERROR_NO_MATCH -> "no match"
+        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "recognizer busy"
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "permission denied"
+        SpeechRecognizer.ERROR_TOO_MANY_REQUESTS -> "too many requests"
+        SpeechRecognizer.ERROR_SERVER_DISCONNECTED -> "service disconnected"
+        SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED -> "language not supported"
+        SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "language unavailable"
+        else -> "unknown"
     }
 
     private fun firstResult(bundle: Bundle?): String? =
