@@ -7,9 +7,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.inputmethodservice.InputMethodService
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.speech.RecognitionListener
 import android.speech.RecognitionService
 import android.speech.RecognizerIntent
@@ -17,19 +22,26 @@ import android.speech.SpeechRecognizer
 import android.util.Log
 import android.widget.Toast
 import androidx.core.content.ContextCompat
+import java.io.OutputStream
 
 /**
  * Drives an installed Offline Voice Input RecognitionService without leaving HeliBoard.
  *
+ * On Android 13+ HeliBoard owns the microphone and passes an already-open PCM stream to
+ * RecognitionService via RecognizerIntent.EXTRA_AUDIO_SOURCE. This is both lower-friction
+ * and more robust for while-in-use microphone permissions: the visible/current IME owns
+ * RECORD_AUDIO, while the background recognizer only consumes PCM and runs inference.
+ *
  * Partial hypotheses are kept in the editor as composing text so a newer hypothesis
  * replaces the previous one instead of being appended. The final result is then
  * finished/committed in place. Tapping the microphone while recognition is active
- * requests an immediate stop/finalize.
+ * closes the audio source and requests immediate finalization.
  */
 object InlineVoiceRecognition {
     private const val TAG = "InlineVoiceRecognition"
     private const val TEST_PACKAGE = "dev.notune.transcribe.unifiedtest"
     private const val RELEASE_PACKAGE = "dev.notune.transcribe"
+    private const val SAMPLE_RATE = 16_000
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -39,6 +51,13 @@ object InlineVoiceRecognition {
     private var hasComposingText = false
     private var lastPartial = ""
     private var leadingSpace = ""
+
+    @Volatile
+    private var capturingAudio = false
+    private var audioRecord: AudioRecord? = null
+    private var audioThread: Thread? = null
+    private var audioSourceRead: ParcelFileDescriptor? = null
+    private var audioSourceOutput: OutputStream? = null
 
     @JvmStatic
     fun isAvailable(context: Context): Boolean = findOfflineRecognizer(context) != null
@@ -68,6 +87,10 @@ object InlineVoiceRecognition {
 
         if (active) {
             showStatus("Voice: stopping…")
+            // Closing the caller-owned pipe tells an EXTRA_AUDIO_SOURCE recognizer that
+            // no more audio is coming. stopListening() remains useful for the fallback
+            // service-microphone path and makes manual finalization immediate.
+            stopCallerAudioCapture()
             recognizer?.stopListening()
             return true
         }
@@ -89,20 +112,165 @@ object InlineVoiceRecognition {
             val speechRecognizer = SpeechRecognizer.createSpeechRecognizer(ime, component)
             recognizer = speechRecognizer
             speechRecognizer.setRecognitionListener(listener)
-            showStatus("Voice: connecting to ${component.packageName}")
-            speechRecognizer.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
                 putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-            })
-            Log.i(TAG, "Started inline recognition with $component")
+            }
+
+            val usingCallerAudio = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+            if (usingCallerAudio) {
+                prepareCallerAudioSource(intent)
+            }
+
+            showStatus("Voice: connecting to ${component.packageName}")
+            speechRecognizer.startListening(intent)
+
+            if (usingCallerAudio) {
+                startCallerAudioCapture()
+                Log.i(TAG, "Started inline recognition with caller-owned AudioRecord: $component")
+            } else {
+                Log.i(TAG, "Started inline recognition with service microphone fallback: $component")
+            }
             true
         } catch (t: Throwable) {
             Log.e(TAG, "Could not start inline recognition", t)
             showStatus("Voice start failed: ${t.javaClass.simpleName}")
+            try {
+                recognizer?.cancel()
+            } catch (_: Throwable) {
+            }
             cleanupRecognizer(keepComposingText = false)
             true
+        }
+    }
+
+    /** Prepare a pipe + AudioRecord before startListening so the read FD is in the intent. */
+    private fun prepareCallerAudioSource(intent: Intent) {
+        stopCallerAudioCapture()
+
+        val pipe = ParcelFileDescriptor.createPipe()
+        audioSourceRead = pipe[0]
+        audioSourceOutput = ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])
+
+        val minBytes = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+        )
+        val bufferBytes = maxOf(minBytes.takeIf { it > 0 } ?: 0, SAMPLE_RATE * 2)
+
+        val record = AudioRecord.Builder()
+            .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SAMPLE_RATE)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                    .build(),
+            )
+            .setBufferSizeInBytes(bufferBytes)
+            .build()
+
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            record.release()
+            throw IllegalStateException("HeliBoard AudioRecord failed to initialize")
+        }
+        audioRecord = record
+
+        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, audioSourceRead)
+        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, SAMPLE_RATE)
+    }
+
+    /** Start microphone capture and write little-endian PCM16 into the recognizer pipe. */
+    private fun startCallerAudioCapture() {
+        val record = audioRecord ?: throw IllegalStateException("AudioRecord not prepared")
+        val output = audioSourceOutput ?: throw IllegalStateException("Audio pipe not prepared")
+
+        capturingAudio = true
+        record.startRecording()
+        if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            capturingAudio = false
+            throw IllegalStateException("HeliBoard AudioRecord failed to start")
+        }
+
+        audioThread = Thread({
+            val samples = ShortArray(1024)
+            val bytes = ByteArray(samples.size * 2)
+            try {
+                while (capturingAudio) {
+                    val count = record.read(samples, 0, samples.size, AudioRecord.READ_BLOCKING)
+                    if (count <= 0) {
+                        if (count < 0 && capturingAudio) {
+                            Log.e(TAG, "HeliBoard AudioRecord read failed: $count")
+                        }
+                        break
+                    }
+
+                    var b = 0
+                    for (i in 0 until count) {
+                        val value = samples[i].toInt()
+                        bytes[b++] = (value and 0xff).toByte()
+                        bytes[b++] = ((value ushr 8) and 0xff).toByte()
+                    }
+                    output.write(bytes, 0, count * 2)
+                }
+            } catch (t: Throwable) {
+                // A closed reader is normal when the recognizer auto-finalizes first.
+                if (capturingAudio) {
+                    Log.w(TAG, "Caller audio pipe ended: ${t.javaClass.simpleName}: ${t.message}")
+                }
+            } finally {
+                try {
+                    output.close()
+                } catch (_: Throwable) {
+                }
+            }
+        }, "heliboard-inline-voice-capture").also { it.start() }
+    }
+
+    private fun stopCallerAudioCapture() {
+        capturingAudio = false
+
+        val record = audioRecord
+        audioRecord = null
+        if (record != null) {
+            try {
+                record.stop()
+            } catch (_: Throwable) {
+            }
+            try {
+                record.release()
+            } catch (_: Throwable) {
+            }
+        }
+
+        val output = audioSourceOutput
+        audioSourceOutput = null
+        try {
+            output?.close()
+        } catch (_: Throwable) {
+        }
+
+        val readSide = audioSourceRead
+        audioSourceRead = null
+        try {
+            readSide?.close()
+        } catch (_: Throwable) {
+        }
+
+        val thread = audioThread
+        audioThread = null
+        if (thread != null && thread != Thread.currentThread()) {
+            try {
+                thread.join(250)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
         }
     }
 
@@ -120,6 +288,8 @@ object InlineVoiceRecognition {
 
         override fun onEndOfSpeech() {
             showStatus("Voice: finalizing…")
+            // The backend may endpoint before the caller; stop producing immediately.
+            stopCallerAudioCapture()
         }
 
         override fun onError(error: Int) {
@@ -195,6 +365,7 @@ object InlineVoiceRecognition {
         bundle?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
 
     private fun cleanupRecognizer(keepComposingText: Boolean) {
+        stopCallerAudioCapture()
         if (!keepComposingText && hasComposingText) {
             owner?.currentInputConnection?.setComposingText("", 1)
         }
