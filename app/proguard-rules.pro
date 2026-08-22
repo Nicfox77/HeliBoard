@@ -3,6 +3,10 @@
     native <methods>;
 }
 
+# The embedded Parakeet worker invokes these callbacks by name through JNI.
+# R8 cannot see those native call sites, so retain the bridge and its members.
+-keep class helium314.keyboard.latin.ParakeetNativeContext { *; }
+
 # Keep classes that are used as a parameter type of methods that are also marked as keep
 # to preserve changing those methods' signature.
 -keep class helium314.keyboard.latin.dictionary.Dictionary

@@ -54,7 +54,7 @@ class RichInputMethodManager private constructor() {
 
     private var shortcuts = listOf<Shortcut>()
 
-    val isShortcutImeReady get() = shortcuts.isNotEmpty()
+    val isShortcutImeReady get() = shortcuts.isNotEmpty() || InlineVoiceRecognition.isAvailable(context)
 
     fun getEnabledInputMethodSubtypes(imi: InputMethodInfo, allowsImplicitlySelectedSubtypes: Boolean) =
         inputMethodInfoCache.getEnabledInputMethodSubtypeList(imi, allowsImplicitlySelectedSubtypes)
@@ -126,13 +126,21 @@ class RichInputMethodManager private constructor() {
         scope.launch { updateShortcutIme() }
     }
 
-    fun switchToShortcutIme(inputMethodService: InputMethodService) = scope.launch {
-        val imiId = shortcuts.firstOrNull()?.imi?.id ?: return@launch
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            inputMethodService.switchInputMethod(imiId, shortcuts.first().subtype)
-        } else {
-            val token = inputMethodService.window.window?.attributes?.token ?: return@launch
-            @Suppress("Deprecation") imm.setInputMethodAndSubtype(token, imiId, shortcuts.first().subtype)
+    fun switchToShortcutIme(inputMethodService: InputMethodService) {
+        // Prefer a normal SpeechRecognizer session when our offline recognizer is
+        // installed. This keeps HeliBoard visible and lets results flow directly
+        // into the current InputConnection. If it is not installed, preserve
+        // HeliBoard's original shortcut-IME behavior unchanged.
+        if (InlineVoiceRecognition.startOrToggle(inputMethodService)) return
+
+        scope.launch {
+            val imiId = shortcuts.firstOrNull()?.imi?.id ?: return@launch
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                inputMethodService.switchInputMethod(imiId, shortcuts.first().subtype)
+            } else {
+                val token = inputMethodService.window.window?.attributes?.token ?: return@launch
+                @Suppress("Deprecation") imm.setInputMethodAndSubtype(token, imiId, shortcuts.first().subtype)
+            }
         }
     }
 
