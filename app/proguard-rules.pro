@@ -6,6 +6,7 @@
 # The embedded Parakeet worker invokes these callbacks by name through JNI, while
 # ParakeetNativeContext also serves as the Android Context used by the model loader.
 # R8 cannot see those native call sites, so retain the bridge and all of its members.
+# This is required for the minified Parakeet development build as well as release builds.
 -keep class helium314.keyboard.latin.ParakeetNativeContext { *; }
 
 # Keep classes that are used as a parameter type of methods that are also marked as keep
