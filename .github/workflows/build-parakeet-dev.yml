@@ -1,10 +1,9 @@
 name: Build HeliBoard Parakeet dev APK
 
 on:
-  pull_request:
   push:
     branches:
-      - feature/parakeet-inline-voice
+      - main
     paths:
       - 'app/**'
       - '.github/workflows/build-parakeet-dev.yml'
@@ -101,15 +100,18 @@ jobs:
           sha256sum dist/HeliBoard-Parakeet-dev.apk | tee dist/HeliBoard-Parakeet-dev.apk.sha256
 
       - name: Publish direct APK dev release
-        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete parakeet-dev --cleanup-tag -y || true
-          gh release create parakeet-dev \
+          if ! gh release view parakeet-dev >/dev/null 2>&1; then
+            gh release create parakeet-dev \
+              --target "$GITHUB_SHA" \
+              --title "HeliBoard Parakeet dev" \
+              --prerelease \
+              --notes "Single-app development build: HeliBoard + embedded Parakeet Unified Q4 streaming engine. The APK is attached directly (not wrapped in a ZIP)."
+          fi
+
+          gh release upload parakeet-dev \
             dist/HeliBoard-Parakeet-dev.apk \
             dist/HeliBoard-Parakeet-dev.apk.sha256 \
-            --target "${{ github.event.pull_request.head.sha || github.sha }}" \
-            --title "HeliBoard Parakeet dev" \
-            --prerelease \
-            --notes "Single-app development build: HeliBoard + embedded Parakeet Unified Q4 streaming engine. The APK is attached directly (not wrapped in a ZIP)."
+            --clobber
