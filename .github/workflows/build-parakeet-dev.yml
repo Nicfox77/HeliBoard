@@ -1,6 +1,7 @@
 name: Build HeliBoard Parakeet dev APK
 
 on:
+  pull_request:
   push:
     branches:
       - main
